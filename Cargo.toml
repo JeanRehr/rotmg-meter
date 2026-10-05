@@ -1,0 +1,8 @@
+[package]
+name = "rotmg-meter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pcap-file = "2.0"
+etherparse = "0.21"
