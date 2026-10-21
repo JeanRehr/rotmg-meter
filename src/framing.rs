@@ -1,8 +1,9 @@
 //! Incrementally separate a TCP byte stream into complete RotMG frames.
 //!
 //! A frame begins with a four-byte big-endian signed length that includes the
-//! full frame, followed by a one-byte packet ID. The remaining body is returned
-//! unchanged; decryption and packet decoding are left to the caller.
+//! full frame, followed by a one-byte packet ID. The decoder extracts that ID
+//! and returns the remaining body unchanged; decryption and packet decoding are
+//! left to the caller.
 
 use std::fmt;
 
@@ -37,13 +38,23 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// A complete frame with its packet ID and opaque body bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Frame {
+    /// The packet ID from the frame header.
+    pub packet_id: u8,
+    /// The bytes after the packet ID, unchanged from the input stream.
+    pub body: Vec<u8>,
+}
+
 /// Separates a direction's ordered TCP bytes into complete RotMG frames.
 ///
 /// The decoder retains at most one incomplete frame, bounded by
-/// `maximum_frame_size`. Complete frames, including their length and packet ID
-/// headers, are returned from [`push`](Self::push). A framing error resets the
-/// decoder; frames completed earlier in that same call are discarded because
-/// the stream is no longer trusted.
+/// `maximum_frame_size`. Complete frames are returned from
+/// [`push`](Self::push), with the length prefix removed and packet ID separated
+/// from the unchanged body. A framing error resets the decoder; frames
+/// completed earlier in that same call are discarded because the stream is no
+/// longer trusted.
 #[derive(Debug)]
 pub struct FrameDecoder {
     maximum_frame_size: usize,
@@ -76,7 +87,7 @@ impl FrameDecoder {
     /// On an invalid or oversized length, the decoder resets and returns an
     /// error. A caller should treat that stream as unusable or explicitly
     /// establish a new framing boundary before continuing.
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, FrameError> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, FrameError> {
         let mut frames = Vec::new();
         let mut input_offset = 0;
 
@@ -124,7 +135,10 @@ impl FrameDecoder {
                 input_offset = end;
 
                 if self.frame_bytes_received == self.frame_length {
-                    frames.push(self.frame.take().expect("complete frame is present"));
+                    let mut complete_frame = self.frame.take().expect("complete frame is present");
+                    let packet_id = complete_frame[4];
+                    let body = complete_frame.split_off(5);
+                    frames.push(Frame { packet_id, body });
                     self.frame_length = 0;
                     self.frame_bytes_received = 0;
                     self.length_bytes = [0; 4];
@@ -148,7 +162,7 @@ impl FrameDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameDecoder, FrameError};
+    use super::{Frame, FrameDecoder, FrameError};
 
     fn frame(packet_id: u8, body: &[u8]) -> Vec<u8> {
         let length = (5 + body.len()) as i32;
@@ -164,7 +178,13 @@ mod tests {
         let frame = frame(75, &[]);
         let mut decoder = FrameDecoder::new(5).unwrap();
 
-        assert_eq!(decoder.push(&frame), Ok(vec![frame]));
+        assert_eq!(
+            decoder.push(&frame),
+            Ok(vec![Frame {
+                packet_id: 75,
+                body: vec![],
+            }])
+        );
     }
 
     #[test]
@@ -174,7 +194,13 @@ mod tests {
         for split in 1..expected.len() {
             let mut decoder = FrameDecoder::new(64).unwrap();
             assert_eq!(decoder.push(&expected[..split]), Ok(Vec::new()));
-            assert_eq!(decoder.push(&expected[split..]), Ok(vec![expected.clone()]));
+            assert_eq!(
+                decoder.push(&expected[split..]),
+                Ok(vec![Frame {
+                    packet_id: 75,
+                    body: vec![1, 2, 3],
+                }])
+            );
         }
     }
 
@@ -193,6 +219,12 @@ mod tests {
                 maximum: 8,
             })
         );
-        assert_eq!(decoder.push(&frame(75, &[])), Ok(vec![frame(75, &[])]));
+        assert_eq!(
+            decoder.push(&frame(75, &[])),
+            Ok(vec![Frame {
+                packet_id: 75,
+                body: vec![],
+            }])
+        );
     }
 }

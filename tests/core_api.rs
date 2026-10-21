@@ -1,5 +1,5 @@
 use rotmg_meter::crypto::{Rc4, Rc4Error};
-use rotmg_meter::framing::{FrameDecoder, FrameError};
+use rotmg_meter::framing::{Frame, FrameDecoder, FrameError};
 use rotmg_meter::transport::{TcpDirectionReassembler, payload_offset};
 
 #[test]
@@ -24,13 +24,24 @@ fn frame(packet_id: u8, body: &[u8]) -> Vec<u8> {
 fn public_frame_decoder_handles_split_and_coalesced_frames() {
     let first = frame(75, &[1, 2, 3]);
     let second = frame(46, &[4, 5]);
+    let expected_first = Frame {
+        packet_id: 75,
+        body: vec![1, 2, 3],
+    };
+    let expected_second = Frame {
+        packet_id: 46,
+        body: vec![4, 5],
+    };
     let mut decoder = FrameDecoder::new(64).unwrap();
 
     assert_eq!(decoder.push(&first[..2]), Ok(Vec::new()));
 
     let mut rest = first[2..].to_vec();
     rest.extend_from_slice(&second);
-    assert_eq!(decoder.push(&rest), Ok(vec![first, second]));
+    assert_eq!(
+        decoder.push(&rest),
+        Ok(vec![expected_first, expected_second])
+    );
 }
 
 #[test]
@@ -48,7 +59,13 @@ fn public_frame_decoder_rejects_invalid_and_oversized_lengths_and_recovers() {
             maximum: 8,
         })
     );
-    assert_eq!(decoder.push(&frame(75, &[])), Ok(vec![frame(75, &[])]));
+    assert_eq!(
+        decoder.push(&frame(75, &[])),
+        Ok(vec![Frame {
+            packet_id: 75,
+            body: vec![],
+        }])
+    );
     assert!(matches!(
         FrameDecoder::new(4),
         Err(FrameError::InvalidMaximumFrameSize(4))
