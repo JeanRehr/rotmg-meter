@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::crypto::Rc4;
+
 /// An invalid frame length or decoder configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrameError {
@@ -157,6 +159,38 @@ impl FrameDecoder {
         self.frame = None;
         self.frame_length = 0;
         self.frame_bytes_received = 0;
+    }
+}
+
+/// Frames a single ordered TCP direction and decrypts each frame body with a
+/// caller-configured RC4 stream.
+///
+/// Keep a separate instance for each connection direction. The cipher state is
+/// advanced over body bytes only and continues across frames; packet IDs and
+/// length prefixes are not decrypted. A framing error invalidates the stream,
+/// so callers should discard this decoder rather than continue with it.
+#[derive(Debug)]
+pub struct EncryptedFrameDecoder {
+    frame_decoder: FrameDecoder,
+    cipher: Rc4,
+}
+
+impl EncryptedFrameDecoder {
+    /// Combine an existing frame decoder with the cipher state for one stream.
+    pub fn new(frame_decoder: FrameDecoder, cipher: Rc4) -> Self {
+        Self {
+            frame_decoder,
+            cipher,
+        }
+    }
+
+    /// Add ordered stream bytes and return complete frames with decrypted bodies.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, FrameError> {
+        let mut frames = self.frame_decoder.push(bytes)?;
+        for frame in &mut frames {
+            self.cipher.apply_keystream(&mut frame.body);
+        }
+        Ok(frames)
     }
 }
 

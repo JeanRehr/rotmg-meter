@@ -1,5 +1,5 @@
 use rotmg_meter::crypto::{Rc4, Rc4Error};
-use rotmg_meter::framing::{Frame, FrameDecoder, FrameError};
+use rotmg_meter::framing::{EncryptedFrameDecoder, Frame, FrameDecoder, FrameError};
 use rotmg_meter::transport::{TcpDirectionReassembler, payload_offset};
 
 #[test]
@@ -18,6 +18,12 @@ fn frame(packet_id: u8, body: &[u8]) -> Vec<u8> {
     frame.push(packet_id);
     frame.extend_from_slice(body);
     frame
+}
+
+fn encrypted_frame(packet_id: u8, body: &[u8], cipher: &mut Rc4) -> Vec<u8> {
+    let mut encrypted_body = body.to_vec();
+    cipher.apply_keystream(&mut encrypted_body);
+    frame(packet_id, &encrypted_body)
 }
 
 #[test]
@@ -95,4 +101,32 @@ fn public_rc4_matches_a_known_vector_and_preserves_stream_state_across_chunks() 
 #[test]
 fn public_rc4_rejects_an_empty_key() {
     assert!(matches!(Rc4::new(&[]), Err(Rc4Error::EmptyKey)));
+}
+
+#[test]
+fn public_encrypted_frame_decoder_decrypts_bodies_in_frame_order() {
+    let key = [1, 2, 3, 4, 5];
+    let mut encryptor = Rc4::new(&key).unwrap();
+    let first = encrypted_frame(75, &[0x10, 0x20], &mut encryptor);
+    let second = encrypted_frame(166, &[0x30, 0x40, 0x50], &mut encryptor);
+    let mut decoder =
+        EncryptedFrameDecoder::new(FrameDecoder::new(64).unwrap(), Rc4::new(&key).unwrap());
+
+    assert_eq!(decoder.push(&first[..6]), Ok(Vec::new()));
+
+    let mut remainder = first[6..].to_vec();
+    remainder.extend_from_slice(&second);
+    assert_eq!(
+        decoder.push(&remainder),
+        Ok(vec![
+            Frame {
+                packet_id: 75,
+                body: vec![0x10, 0x20],
+            },
+            Frame {
+                packet_id: 166,
+                body: vec![0x30, 0x40, 0x50],
+            },
+        ])
+    );
 }
