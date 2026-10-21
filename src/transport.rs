@@ -52,6 +52,53 @@ pub struct TcpSegment<'a> {
     pub payload: &'a [u8],
 }
 
+/// Canonical endpoint order for one direction of a bidirectional TCP flow.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FlowKey {
+    /// The endpoint that sorts first by `SocketAddr` ordering.
+    pub a: SocketAddr,
+    /// The endpoint that sorts second by `SocketAddr` ordering.
+    pub b: SocketAddr,
+}
+
+/// A segment's direction relative to a canonical [`FlowKey`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowDirection {
+    /// From endpoint `a` to endpoint `b`.
+    AtoB,
+    /// From endpoint `b` to endpoint `a`.
+    BtoA,
+}
+
+impl FlowKey {
+    /// Build a bidirectional flow key from a segment's observed endpoints.
+    pub fn for_segment(segment: &TcpSegment<'_>) -> Self {
+        if segment.source <= segment.destination {
+            Self {
+                a: segment.source,
+                b: segment.destination,
+            }
+        } else {
+            Self {
+                a: segment.destination,
+                b: segment.source,
+            }
+        }
+    }
+
+    /// Return the segment direction relative to this key, or `None` if it
+    /// belongs to a different endpoint tuple.
+    pub fn direction_of(&self, segment: &TcpSegment<'_>) -> Option<FlowDirection> {
+        if segment.source == self.a && segment.destination == self.b {
+            Some(FlowDirection::AtoB)
+        } else if segment.source == self.b && segment.destination == self.a {
+            Some(FlowDirection::BtoA)
+        } else {
+            None
+        }
+    }
+}
+
 /// Parse one Ethernet packet into a TCP segment or a reason it was skipped.
 ///
 /// Malformed or truncated packet headers return `InvalidData`. IP fragments
@@ -132,7 +179,9 @@ mod tests {
 
     use etherparse::{PacketBuilder, TcpHeader};
 
-    use super::{IgnoreReason, PacketOutcome, TcpFlags, parse_ethernet_packet};
+    use super::{
+        FlowDirection, FlowKey, IgnoreReason, PacketOutcome, TcpFlags, parse_ethernet_packet,
+    };
 
     fn ipv4_tcp_packet(payload: &[u8]) -> Vec<u8> {
         let mut tcp = TcpHeader::new(41_000, 2_050, 1234, 4096);
@@ -168,6 +217,51 @@ mod tests {
         assert_eq!(segment.acknowledgment_number, 5678);
         assert_eq!(segment.flags, TcpFlags(TcpFlags::ACK | TcpFlags::PSH));
         assert_eq!(segment.payload, &[0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn flow_key_is_bidirectional_and_reports_segment_direction() {
+        let outbound = ipv4_tcp_packet(&[]);
+        let mut inbound = outbound.clone();
+        // Reverse IPv4 addresses and TCP ports while preserving the packet shape.
+        inbound[26..30].copy_from_slice(&[198, 51, 100, 20]);
+        inbound[30..34].copy_from_slice(&[192, 0, 2, 10]);
+        inbound[34..36].copy_from_slice(&2_050_u16.to_be_bytes());
+        inbound[36..38].copy_from_slice(&41_000_u16.to_be_bytes());
+
+        let PacketOutcome::Tcp(outbound) =
+            parse_ethernet_packet(Duration::ZERO, &outbound).unwrap()
+        else {
+            panic!("expected outbound TCP segment");
+        };
+        let PacketOutcome::Tcp(inbound) = parse_ethernet_packet(Duration::ZERO, &inbound).unwrap()
+        else {
+            panic!("expected inbound TCP segment");
+        };
+
+        let key = FlowKey::for_segment(&outbound);
+        assert_eq!(key, FlowKey::for_segment(&inbound));
+        assert_eq!(key.direction_of(&outbound), Some(FlowDirection::AtoB));
+        assert_eq!(key.direction_of(&inbound), Some(FlowDirection::BtoA));
+    }
+
+    #[test]
+    fn flow_key_distinguishes_different_endpoint_tuples() {
+        let first = ipv4_tcp_packet(&[]);
+        let mut other = first.clone();
+        other[37] ^= 1; // Change the destination port.
+
+        let PacketOutcome::Tcp(first) = parse_ethernet_packet(Duration::ZERO, &first).unwrap()
+        else {
+            panic!("expected TCP segment");
+        };
+        let PacketOutcome::Tcp(other) = parse_ethernet_packet(Duration::ZERO, &other).unwrap()
+        else {
+            panic!("expected TCP segment");
+        };
+
+        assert_ne!(FlowKey::for_segment(&first), FlowKey::for_segment(&other));
+        assert_eq!(FlowKey::for_segment(&first).direction_of(&other), None);
     }
 
     #[test]
