@@ -1,12 +1,10 @@
-mod capture;
-mod transport;
-
 use pcap_file::DataLink;
+use rotmg_meter::capture;
+use rotmg_meter::transport::{IgnoreReason, PacketOutcome, parse_ethernet_packet};
 use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
-use transport::{IgnoreReason, PacketOutcome, parse_ethernet_packet};
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1)) {
