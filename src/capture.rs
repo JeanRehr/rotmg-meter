@@ -28,8 +28,16 @@ pub struct CaptureSummary {
     pub truncated_packets: u64,
 }
 
-/// Inspect a classic PCAP stream without retaining packet payloads.
-pub fn inspect_pcap<R: Read>(input: R) -> io::Result<CaptureSummary> {
+/// Visit packet records in a classic PCAP stream without retaining their bytes.
+///
+/// The visitor receives the file's link-layer type, each packet's timestamp,
+/// and a borrowed packet slice. The returned summary contains the global
+/// header metadata and record totals.
+pub fn visit_pcap<R, F>(input: R, mut visitor: F) -> io::Result<CaptureSummary>
+where
+    R: Read,
+    F: FnMut(pcap_file::DataLink, Duration, &[u8]),
+{
     let invalid_capture = |error: pcap_file::PcapError| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -47,6 +55,7 @@ pub fn inspect_pcap<R: Read>(input: R) -> io::Result<CaptureSummary> {
 
     while let Some(packet) = reader.next_packet() {
         let packet = packet.map_err(invalid_capture)?;
+        visitor(header.datalink, packet.timestamp, &packet.data);
         summary.packet_count = summary.packet_count.saturating_add(1);
         summary.earliest_packet = Some(
             summary
@@ -79,7 +88,7 @@ mod tests {
 
     use pcap_file::pcap::{PcapPacket, PcapWriter};
 
-    use super::inspect_pcap;
+    use super::visit_pcap;
 
     fn sample_pcap() -> Vec<u8> {
         let mut writer = PcapWriter::new(Vec::new()).unwrap();
@@ -102,7 +111,7 @@ mod tests {
 
     #[test]
     fn summarizes_metadata_and_truncated_packet_records() {
-        let summary = inspect_pcap(Cursor::new(sample_pcap())).unwrap();
+        let summary = visit_pcap(Cursor::new(sample_pcap()), |_, _, _| {}).unwrap();
 
         assert_eq!(summary.version, (2, 4));
         assert_eq!(summary.link_type, "ETHERNET");
@@ -117,7 +126,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_pcap_data() {
-        let error = inspect_pcap(Cursor::new(b"not a pcap".to_vec())).unwrap_err();
+        let error = visit_pcap(Cursor::new(b"not a pcap".to_vec()), |_, _, _| {}).unwrap_err();
         assert!(error.to_string().contains("capture"));
     }
 
@@ -126,7 +135,37 @@ mod tests {
         let mut bytes = sample_pcap();
         bytes.pop();
 
-        let error = inspect_pcap(Cursor::new(bytes)).unwrap_err();
+        let error = visit_pcap(Cursor::new(bytes), |_, _, _| {}).unwrap_err();
         assert!(error.to_string().contains("capture"));
+    }
+
+    #[test]
+    fn visits_each_packet_with_its_timestamp_and_borrowed_bytes() {
+        let mut visited = Vec::new();
+        let summary = visit_pcap(
+            Cursor::new(sample_pcap()),
+            |link_type, timestamp, packet| {
+                visited.push((link_type, timestamp, packet.to_vec()));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(summary.packet_count, 2);
+        assert_eq!(
+            visited[0],
+            (
+                pcap_file::DataLink::ETHERNET,
+                Duration::from_secs(6),
+                vec![1, 2, 3, 4]
+            )
+        );
+        assert_eq!(
+            visited[1],
+            (
+                pcap_file::DataLink::ETHERNET,
+                Duration::from_secs(4),
+                vec![5, 6]
+            )
+        );
     }
 }
