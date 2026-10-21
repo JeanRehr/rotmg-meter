@@ -7,8 +7,8 @@ separately, so an ID alone is not a packet identity.
 
 ## Evidence snapshot
 
-The reference is the project's checked-out `realmlib` source. Its
-`docs/INDEX.md` identifies `docs/FULL_PROTOCOL_AUDIT_2026-08-01.md` as the
+The reference is the project `realmlib`.
+Its `docs/INDEX.md` identifies `docs/FULL_PROTOCOL_AUDIT_2026-08-01.md` as the
 superseding current-registry/native audit. Packet direction and IDs below are
 from `src/packet-registry.ts` and `protocol/exalt-current.json`; body fields
 are from the packet classes under `src/packets/`. These paths refer to the
