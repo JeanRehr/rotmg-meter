@@ -1,5 +1,6 @@
 //! Parse Ethernet packets into borrowed TCP segments.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -99,6 +100,116 @@ impl FlowKey {
     }
 }
 
+/// Return a segment's payload offset relative to `origin` using TCP serial
+/// number arithmetic. SYN consumes one sequence number before payload bytes.
+///
+/// Returns `None` when the distance is exactly half the sequence number space,
+/// because that distance has no unambiguous forward or backward direction.
+pub fn payload_offset(origin: u32, sequence_number: u32, syn: bool) -> Option<i32> {
+    let payload_sequence = sequence_number.wrapping_add(u32::from(syn));
+    let distance = payload_sequence.wrapping_sub(origin);
+    if distance == (1 << 31) {
+        None
+    } else {
+        Some(distance as i32)
+    }
+}
+
+/// An error encountered while adding a TCP segment to a direction stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReassemblyError {
+    /// The sequence number is exactly half the sequence space from the origin.
+    AmbiguousSequenceNumber,
+    /// A pending byte was retransmitted with a different value.
+    ConflictingOverlap,
+    /// Pending out-of-order data would exceed the configured byte limit.
+    BufferLimitExceeded,
+    /// The stream offset exceeded the supported signed offset range.
+    OffsetOverflow,
+}
+
+/// Reassembles payload bytes for one TCP direction from a known payload origin.
+///
+/// The origin is the sequence number of the first payload byte. Pending bytes
+/// are bounded by `max_pending_bytes`; contiguous bytes are returned by
+/// [`push`](Self::push). Old bytes before the next undelivered offset are
+/// ignored because emitted bytes are not retained for overlap comparison.
+#[derive(Debug)]
+pub struct TcpDirectionReassembler {
+    origin: u32,
+    next_offset: i64,
+    max_pending_bytes: usize,
+    pending: BTreeMap<i64, u8>,
+}
+
+impl TcpDirectionReassembler {
+    /// Create a stream whose origin is the sequence number of its first payload
+    /// byte, with a limit on buffered out-of-order bytes.
+    pub fn new(origin: u32, max_pending_bytes: usize) -> Self {
+        Self {
+            origin,
+            next_offset: 0,
+            max_pending_bytes,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Add payload from a segment and return newly contiguous bytes.
+    ///
+    /// Identical overlaps among pending bytes are treated as retransmissions.
+    /// Conflicting pending overlaps and buffer limit violations leave the
+    /// stream unchanged.
+    pub fn push(
+        &mut self,
+        sequence_number: u32,
+        syn: bool,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ReassemblyError> {
+        if payload.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let offset = payload_offset(self.origin, sequence_number, syn)
+            .ok_or(ReassemblyError::AmbiguousSequenceNumber)?;
+        let mut prospective = self.pending.clone();
+
+        for (index, byte) in payload.iter().copied().enumerate() {
+            let index = i64::try_from(index).map_err(|_| ReassemblyError::OffsetOverflow)?;
+            let byte_offset = i64::from(offset)
+                .checked_add(index)
+                .ok_or(ReassemblyError::OffsetOverflow)?;
+            if byte_offset < self.next_offset {
+                continue;
+            }
+
+            if let Some(existing) = prospective.get(&byte_offset) {
+                if *existing != byte {
+                    return Err(ReassemblyError::ConflictingOverlap);
+                }
+            } else {
+                prospective.insert(byte_offset, byte);
+            }
+        }
+
+        let mut next_offset = self.next_offset;
+        let mut contiguous = Vec::new();
+        while let Some(byte) = prospective.remove(&next_offset) {
+            contiguous.push(byte);
+            next_offset = next_offset
+                .checked_add(1)
+                .ok_or(ReassemblyError::OffsetOverflow)?;
+        }
+
+        if prospective.len() > self.max_pending_bytes {
+            return Err(ReassemblyError::BufferLimitExceeded);
+        }
+
+        self.pending = prospective;
+        self.next_offset = next_offset;
+        Ok(contiguous)
+    }
+}
+
 /// Parse one Ethernet packet into a TCP segment or a reason it was skipped.
 ///
 /// Malformed or truncated packet headers return `InvalidData`. IP fragments
@@ -180,7 +291,8 @@ mod tests {
     use etherparse::{PacketBuilder, TcpHeader};
 
     use super::{
-        FlowDirection, FlowKey, IgnoreReason, PacketOutcome, TcpFlags, parse_ethernet_packet,
+        FlowDirection, FlowKey, IgnoreReason, PacketOutcome, ReassemblyError,
+        TcpDirectionReassembler, TcpFlags, parse_ethernet_packet, payload_offset,
     };
 
     fn ipv4_tcp_packet(payload: &[u8]) -> Vec<u8> {
@@ -262,6 +374,76 @@ mod tests {
 
         assert_ne!(FlowKey::for_segment(&first), FlowKey::for_segment(&other));
         assert_eq!(FlowKey::for_segment(&first).direction_of(&other), None);
+    }
+
+    #[test]
+    fn payload_offset_handles_forward_and_backward_sequence_numbers() {
+        assert_eq!(payload_offset(100, 103, false), Some(3));
+        assert_eq!(payload_offset(100, 98, false), Some(-2));
+    }
+
+    #[test]
+    fn payload_offset_handles_sequence_number_wraparound() {
+        assert_eq!(payload_offset(u32::MAX - 1, 1, false), Some(3));
+        assert_eq!(payload_offset(1, u32::MAX - 1, false), Some(-3));
+    }
+
+    #[test]
+    fn payload_offset_accounts_for_syn_consuming_one_sequence_number() {
+        assert_eq!(payload_offset(100, 100, false), Some(0));
+        assert_eq!(payload_offset(100, 100, true), Some(1));
+    }
+
+    #[test]
+    fn payload_offset_rejects_ambiguous_half_space_distance() {
+        assert_eq!(payload_offset(0, 1 << 31, false), None);
+    }
+
+    #[test]
+    fn reassembler_emits_out_of_order_payload_when_gap_fills() {
+        let mut stream = TcpDirectionReassembler::new(100, 8);
+
+        assert_eq!(stream.push(103, false, b"def"), Ok(Vec::new()));
+        assert_eq!(stream.push(100, false, b"abc"), Ok(b"abcdef".to_vec()));
+    }
+
+    #[test]
+    fn reassembler_ignores_identical_retransmissions_while_pending() {
+        let mut stream = TcpDirectionReassembler::new(100, 8);
+
+        assert_eq!(stream.push(103, false, b"def"), Ok(Vec::new()));
+        assert_eq!(stream.push(103, false, b"def"), Ok(Vec::new()));
+        assert_eq!(stream.push(100, false, b"abc"), Ok(b"abcdef".to_vec()));
+    }
+
+    #[test]
+    fn reassembler_reports_conflicting_pending_overlaps() {
+        let mut stream = TcpDirectionReassembler::new(100, 8);
+
+        assert_eq!(stream.push(103, false, b"def"), Ok(Vec::new()));
+        assert_eq!(
+            stream.push(104, false, b"X"),
+            Err(ReassemblyError::ConflictingOverlap)
+        );
+        assert_eq!(stream.push(100, false, b"abc"), Ok(b"abcdef".to_vec()));
+    }
+
+    #[test]
+    fn reassembler_rejects_pending_data_over_buffer_limit() {
+        let mut stream = TcpDirectionReassembler::new(100, 2);
+
+        assert_eq!(
+            stream.push(103, false, b"def"),
+            Err(ReassemblyError::BufferLimitExceeded)
+        );
+        assert_eq!(stream.push(100, false, b"abc"), Ok(b"abc".to_vec()));
+    }
+
+    #[test]
+    fn reassembler_places_syn_payload_after_syn_sequence_number() {
+        let mut stream = TcpDirectionReassembler::new(101, 8);
+
+        assert_eq!(stream.push(100, true, b"abc"), Ok(b"abc".to_vec()));
     }
 
     #[test]
